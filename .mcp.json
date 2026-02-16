@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "cnki": {
+      "command": "cnki-mcp"
+    }
+  }
+}
