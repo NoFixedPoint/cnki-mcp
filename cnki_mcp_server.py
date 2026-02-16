@@ -307,31 +307,41 @@ async def _simple_search(page: Page, query: str, search_type: str, sort: str, pa
 
 
 async def _professional_search(page: Page, query: str, search_type: str, journal: str, sort: str, pages: int) -> dict:
-    """Search via CNKI Professional Search (with journal filter)."""
+    """Search via CNKI Professional Search (with journal filter).
+
+    Journal names use exact match (LY=), topics use fuzzy match (SU%).
+    Multiple journals can be separated by '+', e.g. '经济研究+管理世界'.
+    """
     resolved_type = resolve_search_type(search_type)
     resolved_sort = resolve_sort_type(sort)
     field_code = PROFESSIONAL_SEARCH_FIELDS.get(resolved_type, "SU")
 
-    expr = f"({field_code}='{query}') AND (JN='{journal}')"
+    # Build expression: topic fuzzy, journal exact
+    # Multiple journals: (LY='j1' OR LY='j2')
+    journals = [j.strip() for j in journal.split("+") if j.strip()]
+    if len(journals) == 1:
+        journal_expr = f"LY='{journals[0]}'"
+    else:
+        journal_expr = "(" + " OR ".join(f"LY='{j}'" for j in journals) + ")"
+    expr = f"{field_code}%'{query}' AND {journal_expr}"
+
+    # Visit main site first for session cookies
+    await page.goto("https://www.cnki.net/")
+    await random_delay(1, 2)
 
     await page.goto("https://kns.cnki.net/kns8s/AdvSearch")
     await random_delay(1, 2)
 
     # Click Professional Search tab
-    try:
-        await page.click("li.professional-search", timeout=5000)
-    except Exception:
-        await page.get_by_text("专业检索").click()
+    await page.click('li[name="majorSearch"]')
     await random_delay(0.5, 1)
 
     # Enter expression
-    textarea = page.locator("textarea.professional-input, textarea#ExpertValue, textarea.search-input")
-    await textarea.fill(expr)
+    await page.locator("textarea.majorSearch").fill(expr)
     await random_delay(0.3, 0.5)
 
     # Click search
-    search_btn = page.locator("div.professional-search input.btn-search, input.btn-search")
-    await search_btn.click()
+    await page.click("input.btn-search")
     await random_delay(2, 3)
 
     if resolved_sort != "相关度":
@@ -365,6 +375,10 @@ async def _get_paper_detail(page: Page, url: str) -> dict:
         "cited_count": "", "download_count": "", "fund": "", "classification": "",
     }
 
+    # Establish session and set referer to avoid captcha
+    await page.goto("https://www.cnki.net/")
+    await random_delay(1, 2)
+    await page.set_extra_http_headers({"Referer": "https://kns.cnki.net/kns8s/AdvSearch"})
     await page.goto(url)
     await random_delay(1.5, 2.5)
 
@@ -474,7 +488,7 @@ async def search_cnki(
         description="搜索类型: 主题/关键词/作者/篇名/DOI (英文: subject/keyword/author/title/doi)"
     )] = "主题",
     journal: Annotated[Optional[str], Field(
-        description="限定期刊名称，如'经济研究'。设置后使用专业检索。"
+        description="限定期刊名称（精确匹配），如'经济研究'。多个期刊用+分隔，如'经济研究+管理世界'。设置后使用专业检索。"
     )] = None,
     pages: Annotated[int, Field(description="搜索页数", ge=1, le=10)] = 1,
     sort: Annotated[str, Field(
