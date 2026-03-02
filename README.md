@@ -29,6 +29,7 @@ playwright install chromium
 |------|-------------|
 | `search_cnki` | Search papers by keyword, author, title, DOI, etc. Optional `journal` param restricts to a specific journal via CNKI professional search. |
 | `get_paper_detail` | Get full metadata (abstract, authors, keywords, DOI, citations, ...) for a paper URL. |
+| `download_paper_pdf` | Download a paper's PDF to a local directory. Requires institutional IP access. |
 | `find_best_match` | Find the paper whose title best matches the input. |
 
 ## Examples
@@ -37,6 +38,7 @@ playwright install chromium
 - "Search CNKI for 人民币国际化 papers in 经济研究"
 - "Search CNKI for 人民币国际化 papers in 管理世界"
 - "Get details for this CNKI paper: \<url\>"
+- "Download the PDF of this paper to D:/papers: \<url\>"
 
 ## Requirements
 
