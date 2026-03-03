@@ -310,24 +310,55 @@ async def _simple_search(page: Page, query: str, search_type: str, sort: str, pa
     }
 
 
-async def _professional_search(page: Page, query: str, search_type: str, journal: str, sort: str, pages: int) -> dict:
-    """Search via CNKI Professional Search (with journal filter).
+def _build_field_expr(field_code: str, query: str) -> str:
+    """Build a CNKI professional search field expression.
 
-    Journal names use exact match (LY=), topics use fuzzy match (SU%).
+    CNKI professional search syntax:
+      * = AND, + = OR, - = NOT
+      SU='term1' * 'term2'  → subject contains term1 AND term2
+      SU=('t1' + 't2') * 't3'  → (t1 OR t2) AND t3
+
+    Single term uses fuzzy match: SU%'经济增长'
+    Multiple space-separated terms uses AND: SU='北京' * '奥运'
+    """
+    terms = query.split()
+    if len(terms) <= 1:
+        # Single term: use fuzzy match
+        return f"{field_code}%'{query}'"
+    else:
+        # Multiple terms: join with * (AND) using exact match
+        parts = " * ".join(f"'{t}'" for t in terms)
+        return f"{field_code}={parts}"
+
+
+async def _professional_search(page: Page, query: str, search_type: str, journal: Optional[str], sort: str, pages: int, author: Optional[str] = None) -> dict:
+    """Search via CNKI Professional Search (with journal/author filter).
+
+    Journal names use exact match (LY=), topics use fuzzy match (SU%),
+    authors use exact match (AU=).
+    Multiple terms in query are joined with * (AND) per CNKI syntax.
     Multiple journals can be separated by '+', e.g. '经济研究+管理世界'.
     """
     resolved_type = resolve_search_type(search_type)
     resolved_sort = resolve_sort_type(sort)
     field_code = PROFESSIONAL_SEARCH_FIELDS.get(resolved_type, "SU")
 
-    # Build expression: topic fuzzy, journal exact
+    # Build expression: start with the main query field
+    expr = _build_field_expr(field_code, query)
+
+    # Add author filter if provided
+    if author:
+        expr += f" AND AU='{author}'"
+
+    # Add journal filter if provided
     # Multiple journals: (LY='j1' OR LY='j2')
-    journals = [j.strip() for j in journal.split("+") if j.strip()]
-    if len(journals) == 1:
-        journal_expr = f"LY='{journals[0]}'"
-    else:
-        journal_expr = "(" + " OR ".join(f"LY='{j}'" for j in journals) + ")"
-    expr = f"{field_code}%'{query}' AND {journal_expr}"
+    if journal:
+        journals = [j.strip() for j in journal.split("+") if j.strip()]
+        if len(journals) == 1:
+            journal_expr = f"LY='{journals[0]}'"
+        else:
+            journal_expr = "(" + " OR ".join(f"LY='{j}'" for j in journals) + ")"
+        expr += f" AND {journal_expr}"
 
     # Visit main site first for session cookies
     await page.goto("https://www.cnki.net/")
@@ -360,11 +391,16 @@ async def _professional_search(page: Page, query: str, search_type: str, journal
 
     all_papers = await _collect_results(page, pages)
 
-    return {
-        "query": query, "search_type": resolved_type, "journal": journal,
+    result = {
+        "query": query, "search_type": resolved_type,
         "sort": resolved_sort, "expression": expr,
         "total_pages": pages, "total_papers": len(all_papers), "papers": all_papers,
     }
+    if author:
+        result["author"] = author
+    if journal:
+        result["journal"] = journal
+    return result
 
 
 # =================== Paper detail ===================
@@ -631,11 +667,15 @@ mcp = FastMCP(
 
     ### search_cnki
     搜索 CNKI 论文。参数:
-    - query: 搜索关键词（必填）
-    - search_type: 搜索类型（主题/关键词/作者/篇名/DOI等）
-    - journal: 限定期刊名称（可选，设置后使用专业检索）
+    - query: 搜索关键词（必填）。只放主题/关键词/篇名，不要把作者名混入 query。多个关键词用空格分隔，自动用 AND 连接。
+    - search_type: 搜索类型（主题/关键词/篇名/DOI等）
+    - author: 按作者筛选（可选）。可与 query 组合使用，如 query='经济增长', author='张三'。
+    - journal: 限定期刊名称（可选），如'经济研究'。多个期刊用+分隔。
     - pages: 页数（1-10）
     - sort: 排序（相关度/发表时间/被引/下载/综合）
+
+    重要：搜索某作者关于某主题的论文时，请分别使用 query 和 author 参数，不要合并到一个参数中。
+    示例：搜索张三关于经济增长的论文 → query='经济增长', author='张三'
 
     ### get_paper_detail
     获取论文详情。参数: url（CNKI 论文详情页 URL）
@@ -658,6 +698,7 @@ mcp = FastMCP(
     3. 用 get_paper_bibtex 获取 BibTeX 引用
     4. 用 download_paper_pdf 下载 PDF（需机构IP）
     5. 用 journal 参数限定期刊范围
+    6. 用 author 参数按作者筛选
     """,
 )
 
@@ -668,11 +709,14 @@ def get_browser_pool(ctx: Context = CurrentContext()) -> BrowserPool:
 
 @mcp.tool()
 async def search_cnki(
-    query: Annotated[str, Field(description="搜索关键词", min_length=1)],
+    query: Annotated[str, Field(description="搜索关键词（主题/篇名等，不要把作者名放在这里，请用 author 参数）。多个关键词用空格分隔，会自动用 AND 连接，如'北京 奥运'→SU='北京' * '奥运'", min_length=1)],
     ctx: Context,
     search_type: Annotated[str, Field(
-        description="搜索类型: 主题/关键词/作者/篇名/DOI (英文: subject/keyword/author/title/doi)"
+        description="搜索类型: 主题/关键词/篇名/DOI (英文: subject/keyword/title/doi)。注意：按作者筛选请用 author 参数而非设置 search_type='作者'"
     )] = "主题",
+    author: Annotated[Optional[str], Field(
+        description="按作者筛选（可与 query 组合使用）。例如搜索某作者关于某主题的论文：query='经济增长', author='张三'。设置后自动使用专业检索。"
+    )] = None,
     journal: Annotated[Optional[str], Field(
         description="限定期刊名称（精确匹配），如'经济研究'。多个期刊用+分隔，如'经济研究+管理世界'。设置后使用专业检索。"
     )] = None,
@@ -682,14 +726,19 @@ async def search_cnki(
     )] = "相关度",
     browser_pool: BrowserPool = Depends(get_browser_pool),
 ) -> dict:
-    """搜索 CNKI 论文，返回论文列表。支持通过 journal 参数限定期刊。"""
-    await ctx.info(f"搜索 CNKI: query='{query}', journal={journal}")
+    """搜索 CNKI 论文，返回论文列表。支持通过 author 和 journal 参数分别筛选作者和期刊。
+
+    重要：query 参数只放主题/关键词/篇名，不要把作者名混入 query。
+    如需按作者搜索，请使用 author 参数。author 和 query 可组合使用。
+    示例：搜索张三关于经济增长的论文 → query='经济增长', author='张三'
+    """
+    await ctx.info(f"搜索 CNKI: query='{query}', author={author}, journal={journal}")
     await ctx.report_progress(progress=0, total=100)
 
     page = await browser_pool.get_page()
     try:
-        if journal:
-            result = await _professional_search(page, query, search_type, journal, sort, pages)
+        if journal or author:
+            result = await _professional_search(page, query, search_type, journal, sort, pages, author=author)
         else:
             result = await _simple_search(page, query, search_type, sort, pages)
     except Exception as e:
