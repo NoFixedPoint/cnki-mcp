@@ -4,6 +4,7 @@ CNKI MCP Server - CNKI academic paper search via MCP.
 Tools:
 - search_cnki: Search papers (with optional journal filter)
 - get_paper_detail: Get full paper metadata
+- get_paper_bibtex: Get BibTeX citation entry for a paper
 - download_paper_pdf: Download paper PDF (requires institutional IP)
 - find_best_match: Find closest title match
 
@@ -24,6 +25,7 @@ import time
 import random
 import json
 import os
+import re
 
 # =================== Search type mappings ===================
 
@@ -399,8 +401,48 @@ async def _get_paper_detail(page: Page, url: str) -> dict:
 
     paper["title"] = await text('div.wx-tit h1') or await text('h1')
     paper["title_en"] = await text('div.wx-tit h2')
-    paper["authors"] = await texts('h3.author span a')
-    paper["institutions"] = await texts('h3.orgn span a')
+
+    # Authors: modern papers have <a> links in h3#authorpart; older papers have plain text
+    author_links = await page.query_selector_all('h3#authorpart a')
+    if author_links:
+        for link in author_links:
+            name = await link.evaluate(
+                '(el) => { el.querySelectorAll("sup").forEach(s => s.remove()); return el.textContent.trim(); }'
+            )
+            if name and not re.match(r'^\d*\.', name):
+                paper["authors"].append(name)
+    else:
+        # Older papers: plain text, comma-separated in h3#authorpart span
+        author_text = await text('h3#authorpart')
+        if author_text:
+            paper["authors"] = [a.strip() for a in re.split(r'[,，;；]', author_text) if a.strip()]
+
+    # Institutions: modern papers use h3.author:not(#authorpart) with <a> links
+    # Older papers use the second h3.author as plain comma-separated text
+    inst_links = await page.query_selector_all('h3.author:not(#authorpart) a')
+    if not inst_links:
+        inst_links = await page.query_selector_all('h3.orgn span a')
+    if inst_links:
+        for link in inst_links:
+            t = (await link.inner_text()).strip()
+            if t:
+                t = re.sub(r'^\d+\.', '', t).strip()
+                if t:
+                    paper["institutions"].append(t)
+    else:
+        # Older papers: plain text institutions
+        inst_h3s = await page.query_selector_all('h3.author:not(#authorpart)')
+        for h3 in inst_h3s:
+            t = (await h3.inner_text()).strip()
+            if t:
+                # Split by comma, strip postal codes (6-digit numbers)
+                insts = re.split(r'[,，;；]', t)
+                for inst in insts:
+                    inst = re.sub(r'^\d+\.', '', inst).strip()
+                    inst = re.sub(r'\s*\d{6}\s*$', '', inst).strip()
+                    if inst and inst not in paper["institutions"]:
+                        paper["institutions"].append(inst)
+
     paper["abstract"] = await text('#ChDivSummary')
     paper["abstract_en"] = await text('#EnChDivSummary')
 
@@ -408,28 +450,124 @@ async def _get_paper_detail(page: Page, url: str) -> dict:
     paper["keywords"] = [(await k.inner_text()).strip().rstrip(';；') for k in kw_els
                          if (await k.inner_text()).strip()]
 
+    # Source (journal name): first link in top-tip pointing to navi.cnki.net
     paper["source"] = await text('div.top-tip a[href*="navi.cnki.net"]')
     paper["source"] = paper["source"].rstrip(' .')
 
-    info_text = await text('div.top-tip span')
-    if ',' in info_text:
-        parts = info_text.split(',')
-        paper["year"] = parts[0].strip()
-        if len(parts) > 1:
-            rest = parts[1]
-            if '(' in rest and ')' in rest:
-                paper["volume"] = rest.split('(')[0].strip()
-                paper["issue"] = rest.split('(')[1].split(')')[0].strip()
-            if ':' in rest:
-                paper["pages"] = rest.split(':')[-1].strip()
+    # Year/Volume/Issue: parse from top-tip links
+    # Format examples: "2026 (02)", "2024,40(05):1-15", "2024,40(05)"
+    top_tip_links = await page.query_selector_all('div.top-tip a')
+    for link in top_tip_links:
+        link_text = (await link.inner_text()).strip()
+        # Look for patterns like "2024,40(05):1-15" or "2026 (02)" or "2024 ,40 (05) :1-15"
+        # Normalize whitespace
+        normalized = re.sub(r'\s+', '', link_text)
+        # Pattern: YYYY or YYYY,VOL(ISSUE):PAGES
+        m = re.match(r'^(\d{4})(?:,(\d+))?\((\d+)\)(?::(.+))?$', normalized)
+        if m:
+            paper["year"] = m.group(1)
+            if m.group(2):
+                paper["volume"] = m.group(2)
+            paper["issue"] = m.group(3)
+            if m.group(4):
+                paper["pages"] = m.group(4)
+            break
+
+    # Pages: also check for "页码：X-Y" spans if not found above
+    if not paper["pages"]:
+        all_spans = await page.query_selector_all('.doc span')
+        for span in all_spans:
+            t = (await span.inner_text()).strip()
+            if t.startswith('页码：'):
+                paper["pages"] = t.replace('页码：', '').strip()
+                break
 
     paper["doi"] = await text('li.top-space:has-text("DOI") p')
     paper["cited_count"] = await text('#refs a') or await text('div.total-inform span:has-text("被引") + em')
     paper["download_count"] = await text('#DownLoadParts a') or await text('div.total-inform span:has-text("下载") + em')
-    paper["fund"] = await text('li:has-text("基金") p') or await text('p.funds span')
+    paper["fund"] = await text('li.top-space:has-text("基金") p') or await text('p.funds span')
     paper["classification"] = await text('li:has-text("分类号") p')
 
     return paper
+
+
+# =================== BibTeX via CNKI official export ===================
+
+async def _get_cnki_bibtex(page: Page, url: str) -> dict:
+    """Get official BibTeX from CNKI export page.
+
+    Flow: detail page → click 引用 → extract export URL → navigate to export
+    page → click BibTex → extract content.
+    """
+    # Establish session
+    await page.goto("https://www.cnki.net/")
+    await random_delay(1, 2)
+    await page.set_extra_http_headers({"Referer": "https://kns.cnki.net/kns8s/AdvSearch"})
+    await page.goto(url)
+    await random_delay(1.5, 2.5)
+
+    # Click 引用 button to open citation popup
+    cite_btn = await page.query_selector('li.btn-quote a')
+    if not cite_btn:
+        return {"isError": True, "error": "引用按钮未找到"}
+    await cite_btn.click()
+    await random_delay(1.5, 2.5)
+
+    # Extract export page URL from the popup
+    export_link = await page.query_selector('.quote-pop a:has-text("更多引用格式")')
+    if not export_link:
+        return {"isError": True, "error": "未找到'更多引用格式'链接"}
+    export_url = await export_link.get_attribute('href')
+    if not export_url:
+        return {"isError": True, "error": "导出链接为空"}
+
+    # Navigate the same page to export URL
+    await page.goto(export_url)
+    await page.wait_for_load_state('networkidle')
+    await random_delay(1.5, 2.5)
+
+    # Click BibTex format option
+    bibtex_link = await page.query_selector('a:has-text("BibTex")')
+    if not bibtex_link:
+        return {"isError": True, "error": "导出页面未找到 BibTex 选项"}
+    await bibtex_link.click()
+    await random_delay(1.5, 2.5)
+
+    # Extract BibTeX content from the literature list
+    content_el = await page.query_selector('ul.literature-list')
+    if not content_el:
+        return {"isError": True, "error": "未找到 BibTeX 内容"}
+    bibtex_raw = (await content_el.inner_text()).strip()
+
+    return {"bibtex": bibtex_raw}
+
+
+def _enrich_bibtex(bibtex_raw: str, paper: dict) -> str:
+    """Enrich official CNKI BibTeX with additional metadata (DOI, abstract, keywords)."""
+    # Find the closing brace
+    if '}' not in bibtex_raw:
+        return bibtex_raw
+
+    lines = bibtex_raw.rstrip().rstrip('}').rstrip()
+
+    # Add fields that CNKI export typically omits
+    extra_fields = []
+    if paper.get("doi") and "doi" not in bibtex_raw.lower():
+        extra_fields.append(f"  doi = {{{paper['doi']}}}")
+    if paper.get("volume") and "volume" not in bibtex_raw.lower():
+        extra_fields.append(f"  volume = {{{paper['volume']}}}")
+    if paper.get("abstract") and "abstract" not in bibtex_raw.lower():
+        extra_fields.append(f"  abstract = {{{paper['abstract']}}}")
+    if paper.get("keywords") and "keywords" not in bibtex_raw.lower():
+        kw = ", ".join(paper["keywords"])
+        extra_fields.append(f"  keywords = {{{kw}}}")
+
+    if extra_fields:
+        # Ensure last existing line ends with comma
+        if not lines.rstrip().endswith(','):
+            lines = lines.rstrip() + ','
+        lines += '\n' + ',\n'.join(extra_fields) + ','
+    return lines.rstrip(',') + '\n}'
 
 
 # =================== PDF download ===================
@@ -502,6 +640,9 @@ mcp = FastMCP(
     ### get_paper_detail
     获取论文详情。参数: url（CNKI 论文详情页 URL）
 
+    ### get_paper_bibtex
+    获取论文 BibTeX 引用条目（可直接放入 .bib 文件）。参数: url（CNKI 论文详情页 URL）
+
     ### download_paper_pdf
     下载论文 PDF 文件。参数:
     - url: CNKI 论文详情页 URL
@@ -514,8 +655,9 @@ mcp = FastMCP(
     ## 使用建议
     1. 先用 search_cnki 搜索
     2. 用 get_paper_detail 获取详情
-    3. 用 download_paper_pdf 下载 PDF（需机构IP）
-    4. 用 journal 参数限定期刊范围
+    3. 用 get_paper_bibtex 获取 BibTeX 引用
+    4. 用 download_paper_pdf 下载 PDF（需机构IP）
+    5. 用 journal 参数限定期刊范围
     """,
 )
 
@@ -619,6 +761,44 @@ async def download_paper_pdf(
 
 
 @mcp.tool()
+async def get_paper_bibtex(
+    url: Annotated[str, Field(description="CNKI 论文详情页 URL")],
+    ctx: Context,
+    browser_pool: BrowserPool = Depends(get_browser_pool),
+) -> dict:
+    """获取 CNKI 论文的 BibTeX 引用条目（来自 CNKI 官方导出，并补充 DOI、摘要、关键词），可直接复制到 .bib 文件中使用。"""
+    if not url or "cnki" not in url.lower():
+        return {"isError": True, "error": "URL 必须是 CNKI 链接"}
+
+    await ctx.info(f"获取论文 BibTeX: {url[:80]}...")
+    await ctx.report_progress(progress=0, total=100)
+
+    page = await browser_pool.get_page()
+    try:
+        # First scrape detail page for supplementary metadata
+        paper = await _get_paper_detail(page, url)
+        await ctx.report_progress(progress=40, total=100)
+
+        # Then get official BibTeX from CNKI export
+        bib_result = await _get_cnki_bibtex(page, url)
+        await ctx.report_progress(progress=80, total=100)
+    except Exception as e:
+        return {"isError": True, "error": str(e), "url": url}
+    finally:
+        await page.close()
+
+    if bib_result.get("isError"):
+        await ctx.error(f"官方导出失败: {bib_result.get('error')}")
+        return bib_result
+
+    # Enrich official BibTeX with supplementary fields
+    bibtex = _enrich_bibtex(bib_result["bibtex"], paper)
+    await ctx.report_progress(progress=100, total=100)
+    await ctx.info("BibTeX 已生成（CNKI 官方导出 + 补充字段）")
+    return {"url": url, "bibtex": bibtex, "paper": paper}
+
+
+@mcp.tool()
 async def find_best_match(
     query: Annotated[str, Field(description="论文标题", min_length=1)],
     ctx: Context,
@@ -682,8 +862,8 @@ async def get_server_status(ctx: Context) -> str:
         "server_name": "CNKI 论文检索服务",
         "version": "0.1.0",
         "backend": "Playwright (async)",
-        "tools": ["search_cnki", "get_paper_detail", "download_paper_pdf", "find_best_match"],
-        "features": ["journal_filter_via_professional_search", "pdf_download", "browser_pool", "idle_timeout"],
+        "tools": ["search_cnki", "get_paper_detail", "get_paper_bibtex", "download_paper_pdf", "find_best_match"],
+        "features": ["journal_filter_via_professional_search", "bibtex_export", "pdf_download", "browser_pool", "idle_timeout"],
     }, ensure_ascii=False, indent=2)
 
 
