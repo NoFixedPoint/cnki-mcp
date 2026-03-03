@@ -78,6 +78,35 @@ USER_AGENTS = [
 ]
 
 
+# =================== Paper Registry ===================
+
+class PaperRegistry:
+    """Maps short labels to CNKI URLs. Labels are returned to agents instead of URLs."""
+
+    def __init__(self):
+        self._labels: dict[str, str] = {}  # label → URL
+        self._counter: int = 0
+
+    def register(self, url: str, first_author: str = "", year: str = "", title: str = "") -> str:
+        """Register a paper URL and return a short label."""
+        self._counter += 1
+        author_part = first_author[:6] if first_author else ""
+        year_part = year[:4] if year else ""
+        title_part = title[:10] if title else ""
+        label = f"[{self._counter}] {author_part}{year_part}-{title_part}"
+        self._labels[label] = url
+        return label
+
+    def resolve(self, label: str) -> str:
+        """Resolve a label to a URL. Raises KeyError if not found."""
+        if label not in self._labels:
+            raise KeyError(f"Unknown paper label: '{label}'. Use search_cnki first to get valid labels.")
+        return self._labels[label]
+
+
+paper_registry = PaperRegistry()
+
+
 # =================== BrowserPool ===================
 
 class BrowserPool:
@@ -255,6 +284,12 @@ async def _collect_results(page: Page, pages: int) -> list:
                 paper = await _parse_paper_row(row)
                 if paper["title"]:
                     paper["page"] = page_num
+                    # Register paper and replace URL with label
+                    first_author = paper["authors"][0] if paper.get("authors") else ""
+                    year = paper.get("date", "")[:4]
+                    label = paper_registry.register(paper["url"], first_author, year, paper["title"])
+                    paper["label"] = label
+                    del paper["url"]
                     all_papers.append(paper)
         except Exception:
             pass
@@ -408,7 +443,7 @@ async def _professional_search(page: Page, query: str, search_type: str, journal
 async def _get_paper_detail(page: Page, url: str) -> dict:
     """Navigate to a CNKI paper detail page and extract metadata."""
     paper = {
-        "url": url, "title": "", "title_en": "", "authors": [],
+        "title": "", "title_en": "", "authors": [],
         "institutions": [], "abstract": "", "abstract_en": "",
         "keywords": [], "keywords_en": [], "source": "", "year": "",
         "volume": "", "issue": "", "pages": "", "doi": "",
@@ -634,7 +669,6 @@ async def _download_paper_pdf(page: Page, url: str, save_dir: str) -> dict:
     await download.save_as(save_path)
 
     return {
-        "url": url,
         "file_path": save_path,
         "file_name": suggested_name,
         "file_size": os.path.getsize(save_path),
@@ -663,42 +697,39 @@ mcp = FastMCP(
     instructions="""
     CNKI (中国知网) 论文检索 MCP 服务器。
 
+    ## 核心概念：论文标签
+
+    搜索结果中每篇论文会返回一个短标签（如 `[1] 张三2024-经济增长与数字`），
+    后续操作（获取详情、BibTeX、下载PDF）都使用这个标签，无需传递 URL。
+
     ## 工具
 
     ### search_cnki
-    搜索 CNKI 论文。参数:
-    - query: 搜索关键词（必填）。只放主题/关键词/篇名，不要把作者名混入 query。多个关键词用空格分隔，自动用 AND 连接。
+    搜索 CNKI 论文，返回带标签的论文列表。参数:
+    - query: 搜索关键词（必填）。只放主题/关键词/篇名，不要把作者名混入 query。
     - search_type: 搜索类型（主题/关键词/篇名/DOI等）
-    - author: 按作者筛选（可选）。可与 query 组合使用，如 query='经济增长', author='张三'。
-    - journal: 限定期刊名称（可选），如'经济研究'。多个期刊用+分隔。
+    - author: 按作者筛选（可选）
+    - journal: 限定期刊名称（可选）
     - pages: 页数（1-10）
     - sort: 排序（相关度/发表时间/被引/下载/综合）
 
-    重要：搜索某作者关于某主题的论文时，请分别使用 query 和 author 参数，不要合并到一个参数中。
-    示例：搜索张三关于经济增长的论文 → query='经济增长', author='张三'
-
     ### get_paper_detail
-    获取论文详情。参数: url（CNKI 论文详情页 URL）
+    获取论文详情。参数: paper（论文标签）
 
     ### get_paper_bibtex
-    获取论文 BibTeX 引用条目（可直接放入 .bib 文件）。参数: url（CNKI 论文详情页 URL）
+    获取论文 BibTeX 引用。参数: paper（论文标签）
 
     ### download_paper_pdf
-    下载论文 PDF 文件。参数:
-    - url: CNKI 论文详情页 URL
-    - save_dir: PDF 保存目录的绝对路径
-    需要机构IP访问权限。
+    下载论文 PDF。参数: paper（论文标签）, save_dir（保存路径）
 
     ### find_best_match
-    查找最匹配的论文标题。参数: query（论文标题）
+    查找最匹配的论文标题，返回标签。参数: query（论文标题）
 
-    ## 使用建议
-    1. 先用 search_cnki 搜索
-    2. 用 get_paper_detail 获取详情
-    3. 用 get_paper_bibtex 获取 BibTeX 引用
-    4. 用 download_paper_pdf 下载 PDF（需机构IP）
-    5. 用 journal 参数限定期刊范围
-    6. 用 author 参数按作者筛选
+    ## 使用流程
+    1. 用 search_cnki 搜索，获取论文标签列表
+    2. 用标签调用 get_paper_detail 获取详情
+    3. 用标签调用 get_paper_bibtex 获取 BibTeX
+    4. 用标签调用 download_paper_pdf 下载 PDF
     """,
 )
 
@@ -756,51 +787,58 @@ async def search_cnki(
 
 @mcp.tool()
 async def get_paper_detail(
-    url: Annotated[str, Field(description="CNKI 论文详情页 URL")],
+    paper: Annotated[str, Field(description="论文标签（从 search_cnki 返回的 label 字段）")],
     ctx: Context,
     browser_pool: BrowserPool = Depends(get_browser_pool),
 ) -> dict:
     """获取 CNKI 论文详情页的完整信息。"""
-    if not url or "cnki" not in url.lower():
-        return {"isError": True, "error": "URL 必须是 CNKI 链接"}
+    try:
+        url = paper_registry.resolve(paper)
+    except KeyError as e:
+        return {"isError": True, "error": str(e)}
 
-    await ctx.info(f"获取论文详情: {url[:80]}...")
+    await ctx.info(f"获取论文详情: {paper}")
     await ctx.report_progress(progress=0, total=100)
 
     page = await browser_pool.get_page()
     try:
         result = await _get_paper_detail(page, url)
     except Exception as e:
-        result = {"isError": True, "error": str(e), "url": url}
+        result = {"isError": True, "error": str(e), "paper": paper}
     finally:
         await page.close()
 
+    result["paper"] = paper
     await ctx.report_progress(progress=100, total=100)
     return result
 
 
 @mcp.tool()
 async def download_paper_pdf(
-    url: Annotated[str, Field(description="CNKI 论文详情页 URL")],
+    paper: Annotated[str, Field(description="论文标签（从 search_cnki 返回的 label 字段）")],
     save_dir: Annotated[str, Field(description="PDF 保存目录的绝对路径")],
     ctx: Context,
     browser_pool: BrowserPool = Depends(get_browser_pool),
 ) -> dict:
     """下载 CNKI 论文 PDF 文件到指定目录。需要机构IP访问权限。"""
-    if not url or "cnki" not in url.lower():
-        return {"isError": True, "error": "URL 必须是 CNKI 链接"}
+    try:
+        url = paper_registry.resolve(paper)
+    except KeyError as e:
+        return {"isError": True, "error": str(e)}
 
-    await ctx.info(f"下载论文 PDF: {url[:80]}...")
+    await ctx.info(f"下载论文 PDF: {paper}")
     await ctx.report_progress(progress=0, total=100)
 
     page = await browser_pool.get_page()
     try:
         result = await _download_paper_pdf(page, url, save_dir)
     except Exception as e:
-        result = {"isError": True, "error": str(e), "url": url}
+        result = {"isError": True, "error": str(e), "paper": paper}
     finally:
         await page.close()
 
+    result.pop("url", None)
+    result["paper"] = paper
     await ctx.report_progress(progress=100, total=100)
     if result.get("isError"):
         await ctx.error(f"下载失败: {result.get('error')}")
@@ -811,28 +849,28 @@ async def download_paper_pdf(
 
 @mcp.tool()
 async def get_paper_bibtex(
-    url: Annotated[str, Field(description="CNKI 论文详情页 URL")],
+    paper: Annotated[str, Field(description="论文标签（从 search_cnki 返回的 label 字段）")],
     ctx: Context,
     browser_pool: BrowserPool = Depends(get_browser_pool),
 ) -> dict:
     """获取 CNKI 论文的 BibTeX 引用条目（来自 CNKI 官方导出，并补充 DOI、摘要、关键词），可直接复制到 .bib 文件中使用。"""
-    if not url or "cnki" not in url.lower():
-        return {"isError": True, "error": "URL 必须是 CNKI 链接"}
+    try:
+        url = paper_registry.resolve(paper)
+    except KeyError as e:
+        return {"isError": True, "error": str(e)}
 
-    await ctx.info(f"获取论文 BibTeX: {url[:80]}...")
+    await ctx.info(f"获取论文 BibTeX: {paper}")
     await ctx.report_progress(progress=0, total=100)
 
     page = await browser_pool.get_page()
     try:
-        # First scrape detail page for supplementary metadata
-        paper = await _get_paper_detail(page, url)
+        paper_detail = await _get_paper_detail(page, url)
         await ctx.report_progress(progress=40, total=100)
 
-        # Then get official BibTeX from CNKI export
         bib_result = await _get_cnki_bibtex(page, url)
         await ctx.report_progress(progress=80, total=100)
     except Exception as e:
-        return {"isError": True, "error": str(e), "url": url}
+        return {"isError": True, "error": str(e), "paper": paper}
     finally:
         await page.close()
 
@@ -840,11 +878,10 @@ async def get_paper_bibtex(
         await ctx.error(f"官方导出失败: {bib_result.get('error')}")
         return bib_result
 
-    # Enrich official BibTeX with supplementary fields
-    bibtex = _enrich_bibtex(bib_result["bibtex"], paper)
+    bibtex = _enrich_bibtex(bib_result["bibtex"], paper_detail)
     await ctx.report_progress(progress=100, total=100)
     await ctx.info("BibTeX 已生成（CNKI 官方导出 + 补充字段）")
-    return {"url": url, "bibtex": bibtex, "paper": paper}
+    return {"paper": paper, "bibtex": bibtex}
 
 
 @mcp.tool()
@@ -882,9 +919,10 @@ async def find_best_match(
             result = {"query": query, "best_match": None, "message": "未找到结果"}
         else:
             idx = find_closest_title(query, titles)
+            label = paper_registry.register(urls[idx], "", "", titles[idx])
             result = {
                 "query": query,
-                "best_match": {"title": titles[idx], "url": urls[idx]},
+                "best_match": {"title": titles[idx], "label": label},
                 "total_results": len(titles),
             }
     except Exception as e:
